@@ -8,7 +8,7 @@ from mavsdk.offboard import VelocityBodyYawspeed, OffboardError
 
 import matplotlib.pyplot as plt
 
-DEBUG = True
+DEBUG = False
 SIM = True
 POLE_LATLON = False
 
@@ -28,12 +28,18 @@ pole1_rel = (-80, 20)
 pole2_rel = (-230, 20)
 
 clearance = 30
-precision = 10
+precision = 15
+# precision = 50
 
 # Mission Parameters
 speed = 25.0
 acceptance_radius = 10.0
 alt_mission = 10.0
+
+area_width, area_length = 100.0, 30.0   # meters (width across lanes, length along flight)
+alt = 10.0
+fov = 70.0
+overlap = 0.30
 
 lap = [
     #[pi, clearance, rotation_direction]
@@ -42,7 +48,7 @@ lap = [
     [np.pi, clearance - 25, -1]
     ]
 
-mission_num = 1
+mission_num = 2
 home_lat, home_lon = 0.0, 0.0
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -101,6 +107,80 @@ def plot_waypoints(waypoints):
     plt.grid()
     plt.show()  
 
+def generate_capsule_waypoints(A, B, r, tau):
+    """
+    tau ∈ [0,1] = global progress around capsule
+    returns a point on the capsule boundary
+    """
+
+    A = np.array(A, dtype=float)
+    B = np.array(B, dtype=float)
+
+    v = B - A
+    L = np.linalg.norm(v)
+
+    u = v / L
+    n = np.array([-u[1], u[0]])
+
+    P = 2*L + 2*np.pi*r   # total perimeter
+    t = tau * P           # convert normalized → arc length
+    # print(f"tau = {tau},t = {t}")
+
+
+    # ----- Region 1 : Top line -----
+    
+    if t < L:
+        s = t / L
+        p =  A + r*n + s*v
+        segment = 0
+
+    # ----- Region 2 : Semicircle at B -----
+    elif t < L + np.pi*r:
+        t2 = t - L
+        theta = t2/r - np.pi/2
+        p = B + r*(np.cos(theta)*u - np.sin(theta)*n)
+        segment = 1
+
+    # ----- Region 3 : Bottom line -----
+    elif t < 2*L + np.pi*r:
+        t3 = t - (L + np.pi*r)
+        s = t3 / L
+        p =  B - r*n - s*v
+        segment = 2
+
+    # ----- Region 4 : Semicircle at A -----
+    else:
+        t4 = t - (2*L + np.pi*r)
+        theta = t4/r - np.pi/2
+        p=  A + r*(-np.cos(theta)*u + np.sin(theta)*n)
+        segment = 3
+    return np.array([p[0], p[1], segment])
+
+def perpendicular_offset(point_a, point_b, origin_point,side, clearance):
+    """
+    Compute point = point_b offset by `clearance` meters perpendicular to line (point_a->point_b).
+    `origin_point` is used to choose which side of the line we want:
+      - if the normal points toward origin_point, keep it; otherwise flip it.
+    Returns numpy array [x, y].
+    """
+    a = np.asarray(point_a, dtype=float)
+    b = np.asarray(point_b, dtype=float)
+    origin = np.asarray(origin_point, dtype=float)
+
+    # direction from a -> b
+    v = b - a
+    if np.allclose(v, 0):
+        raise ValueError("pole points are identical")
+
+    # 90° rotation (one perpendicular)
+    n = np.array([-v[1], v[0]], dtype=float)
+
+    # normalize to unit length
+    n /= np.linalg.norm(n)
+
+    return origin + clearance * side * n
+
+
 def generate_figure8_around_poles(pole1_xy, pole2_xy, clearance_meters, precision):
 
     x1, y1 = pole1_xy
@@ -135,27 +215,12 @@ def generate_figure8_around_poles(pole1_xy, pole2_xy, clearance_meters, precisio
             waypoints_xy.append((final_x, final_y))
 
     waypoints_xy.append((center_x, center_y))
-    # perpendicular to pole line
-    vx = x2 - x1
-    vy = y2 - y1
 
-    nx = -vy
-    ny = vx
+    perp_center = perpendicular_offset(pole1_xy, pole2_xy, (center_x, center_y), -1, clearance_meters)
+    waypoints_xy.append(perp_center)
 
-    length = np.sqrt(nx**2 + ny**2)
-    nx /= length
-    ny /= length
-
-    point_center = (
-        center_x + nx * clearance_meters,
-        center_y + ny * clearance_meters
-    )
-    waypoints_xy.append(point_center)
-    point_home = (
-    nx * clearance_meters,
-    ny * clearance_meters
-    )
-    waypoints_xy.append(point_home)
+    perp_home = perpendicular_offset(pole1_xy, pole2_xy, (home_lat, home_lon), -1, clearance_meters)
+    waypoints_xy.append(perp_home)
 
     
     return waypoints_xy
@@ -209,6 +274,67 @@ def create_mission_items(waypoints, flight_alt_agl):
         mission_items.append(item)
 
     return mission_items
+
+def generate_scan(area_length, area_width, altitude, fov_deg, overlap,
+                  N_line=10, N_turn=4):
+    
+    # --- camera footprint ---
+    swath = 2 * altitude * np.tan(np.radians(fov_deg/2))
+    lane_spacing = swath * (1 - overlap)
+
+    # --- number of lanes ---
+    n_lanes = int(np.ceil(area_width / lane_spacing))
+
+    # --- center lanes ---
+    total_span = (n_lanes - 1) * lane_spacing
+    x0 = -total_span / 2
+    lane_x = x0 + np.arange(n_lanes) * lane_spacing
+
+    # --- turn radius ---
+    r = lane_spacing / 2
+
+    half_len = area_length / 2
+
+    waypoints = []
+
+    for i in range(n_lanes):
+
+        x = lane_x[i]
+
+        # alternate direction
+        going_up = (i % 2 == 0)
+
+        if going_up:
+            y_start, y_end = -half_len, half_len
+        else:
+            y_start, y_end = half_len, -half_len
+
+        # --- straight lane ---
+        xs = np.linspace(y_start, y_end, N_line)
+        ys = np.full_like(xs, x)
+        waypoints.extend(zip(xs, ys))
+
+        # --- turn ---
+        if i < n_lanes - 1:
+
+            x_next = lane_x[i+1]
+            y_turn = y_end
+            cx = y_turn
+            cy = (x + x_next) / 2   
+
+            if going_up:
+                theta = np.linspace(np.pi, 0, N_turn)
+            else:
+                theta = np.linspace(0, np.pi, N_turn)
+            arc_x = cx + r*np.sin(theta)
+            if going_up:
+                arc_y = cy + r*np.cos(theta)
+            else:
+                arc_y = cy - r*np.cos(theta)
+
+            waypoints.extend(zip(arc_x, arc_y))
+
+    return np.array(waypoints)
 
 
 # INTERCEPTION - UNUSED
@@ -447,14 +573,19 @@ async def run():
     await drone.mission.clear_mission()
     print("Generating and uploading new mission...")
 
+    if POLE_LATLON:
+        
+        rel_pole1 = latlon_to_xy(pole1[0], pole1[1], home_lat, home_lon)
+        rel_pole2 = latlon_to_xy(pole2[0], pole2[1], home_lat, home_lon)
+    else:
+        rel_pole1 = pole1_rel
+        rel_pole2 = pole2_rel
+    print(f"relative, pole1: {rel_pole1}, pole2: {rel_pole2}")
+
+    v = np.array(rel_pole2) - np.array(rel_pole1)
+
     if mission_num == 1:
         print("Creating mission 1")
-        if POLE_LATLON:
-            rel_pole1 = latlon_to_xy(pole1[0], pole1[1], home_lat, home_lon)
-            rel_pole2 = latlon_to_xy(pole2[0], pole2[1], home_lat, home_lon)
-        else:
-            rel_pole1 = pole1_rel
-            rel_pole2 = pole2_rel
         waypoints = generate_figure8_around_poles(rel_pole1, rel_pole2, clearance, precision)
 
         waypoints.append((latlon_to_xy(home_lat, home_lon, home_lat, home_lon))) 
@@ -463,6 +594,47 @@ async def run():
         waypoints = xy_to_latlon(waypoints, home_lat, home_lon)
     elif mission_num == 2:
         print("Creating mission 2")
+        wp = np.array([generate_capsule_waypoints(rel_pole1, rel_pole2, clearance, i/(precision-1)) for i in range(precision)])
+        mask = wp[:,2] < 2
+
+        waypoints = np.array([wp[i][:2] for i in range(len(wp))])  # Extract only x,y coordinates
+        waypoints = waypoints[mask][:,:2] #remove last point
+
+        pts = generate_scan(area_width, area_length, alt, fov, overlap, N_line=10, N_turn=4)
+        x1, y1 = rel_pole1
+        x2, y2 = rel_pole2
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+
+        pts[:,0] *= -1
+        pts = np.array(pts) - (np.array(center_x), np.array(center_y+clearance))
+
+        vx = v[0]
+        vy = v[1]
+        v = np.array([vx, vy])
+
+
+
+        theta = np.arctan2(v[1], v[0])
+        R = np.array([
+                    [np.cos(theta), -np.sin(theta)],
+                    [np.sin(theta),  np.cos(theta)]
+                ])
+        pts  = (pts @ R.T)
+
+        waypoints = np.append(waypoints, pts, axis=0)
+        
+
+        perp_home = (perpendicular_offset(rel_pole1, rel_pole2, (0, 0), -1, clearance))
+
+        print(f"perp home {perp_home}")
+
+        waypoints = np.vstack([waypoints, perp_home])
+
+        plot_waypoints(waypoints)
+        waypoints = xy_to_latlon(waypoints, home_lat, home_lon)
+
+
     mission_items = create_mission_items(waypoints, alt_mission)
 
     if DEBUG:
