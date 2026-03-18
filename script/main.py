@@ -8,7 +8,7 @@ from mavsdk.offboard import VelocityBodyYawspeed, OffboardError
 
 import matplotlib.pyplot as plt
 
-DEBUG = False
+DEBUG = True
 SIM = True
 POLE_LATLON = False
 
@@ -48,7 +48,7 @@ lap = [
     [np.pi, clearance - 25, -1]
     ]
 
-mission_num = 2
+mission_num = 1
 home_lat, home_lon = 0.0, 0.0
 
 def haversine_distance(lat1, lon1, lat2, lon2):

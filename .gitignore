@@ -3,3 +3,6 @@ rdk/
 exec/
 logs/
 terrain/
+rdk/rdk_*
+rdk/*.xz
+
