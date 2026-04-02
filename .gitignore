@@ -1,8 +1,14 @@
 ardupilot/
-rdk/
-exec/
+
+*.tlog
+*.tlog.raw
 logs/
 terrain/
+
+rdk/Ai_Toolchain_Package-release-v1.23.8-OE-v1.2.6
 rdk/rdk_*
 rdk/*.xz
 
+exec/
+syn_dataset/yolo_drone_dataset/*
+syn_dataset/output*/*
