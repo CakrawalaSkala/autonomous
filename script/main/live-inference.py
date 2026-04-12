@@ -1,11 +1,7 @@
 """
-Live YOLO Inference Script
---------------------------
-Requirements:
-    pip install ultralytics opencv-python
 
 Usage:
-    python live_inference.py                        # webcam (default)
+    python live_inference.py                        # screen (default)
     python live_inference.py --source 0             # webcam index 0
     python live_inference.py --source video.mp4     # video file
     python live_inference.py --source rtsp://...    # RTSP stream
@@ -24,63 +20,41 @@ from pathlib import Path
 from collections import deque
 from ultralytics import YOLO
 
-from memory_config import meta_dtype, NUM_CLASSES, dtype, COLOR_TO_ID
-from multiprocessing import shared_memory
-red_lower = np.array([136, 87, 111], np.uint8)
-red_upper = np.array([180, 255, 255], np.uint8)
+import zmq, msgpack_numpy as m
+
+import memory_config as cfg
+
+
 
 from mss import mss
-# define mask
 
-#green color
-green_lower = np.array([25, 52, 72], np.uint8)
-green_upper = np.array([102, 255, 255], np.uint8)
-
-#blue color
-blue_lower = np.array([94, 80, 2], np.uint8)
-blue_upper = np.array([120, 255, 255], np.uint8)
-
-# ─────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────
-MODEL_PATH   = "rdk/model/best.pt"       # ← change if your .pt lives elsewhere
+MODEL_PATH   = "rdk/model/best.pt"      
 CONF_THRESH  = 0.40            # minimum confidence to show a box
 IOU_THRESH   = 0.45            # NMS IoU threshold
 IMG_SIZE     = 640             # inference resolution
 DEVICE       = ""              # "" = auto (GPU if available, else CPU)
 FPS_WINDOW   = 30              # rolling average over N frames
 
-# Colour palette (BGR) — one per class, cycling if more classes than colours
-PALETTE = [
-    (0,   200, 255), (0,   255, 128), (255, 80,  80),
-    (80,  80,  255), (255, 200, 0  ), (180, 0,   255),
-    (0,   255, 200), (255, 128, 0  ), (0,   180, 255),
-    (128, 255, 0  ),
-]
 
-def get_shm_writer(name, size):
-    try:
-        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
-    except FileExistsError:
-        # leftover from previous crash — clean it up and recreate
-        old = shared_memory.SharedMemory(name=name)
-        old.unlink()
-        old.close()
-        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
-    return shm
+def zmq_create():
+    context = zmq.Context()
+    socket = context.socket(zmq.PUB)
+    socket.bind(cfg.IPC_PATH)
+    # socket.setsockopt_string(zmq.SNDHWM, "1")
 
-shm = get_shm_writer("yolo", meta_dtype.itemsize)
-mem = np.ndarray((), dtype=meta_dtype, buffer=shm.buf)
-mem['seq'] = 0
+    return socket
 
+def zmq_close(socket):
+    socket.unbind(cfg.IPC_PATH)
+    socket.close()
 
-def color_for(class_id: int):
-    return PALETTE[class_id % len(PALETTE)]
+def zmq_send(socket, data):
+    packed = m.packb(data)
+    socket.send(packed)
 
 
 def draw_box(frame, x1, y1, x2, y2, label: str, conf: float, class_id: int):
-    """Draw a filled-header bounding box."""
-    color = color_for(class_id)
+    color = (0, 0, 0)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
     text  = f"{label}  {conf:.0%}"
@@ -124,7 +98,7 @@ def draw_class_summary(frame, class_counts: dict, names: dict):
     for cls_id, cnt in sorted(class_counts.items()):
         label = names.get(cls_id, str(cls_id))
         text  = f"{label}: {cnt}"
-        color = color_for(cls_id)
+        color = (0,0,0)
         cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, color, 2, cv2.LINE_AA)
         y += 22
@@ -145,37 +119,32 @@ def color_det(x1, y1, x2, y2, image, class_id):
     
     h, s, v = dominant_hsv
     if s < 40:
-        if v < 60:   return "hitam"
-        if v > 200:  return "putih"
-        return "abu-abu"
+        if v < 60:   return cfg.COLOR_DICT["black"]
+        if v > 200:  return cfg.COLOR_DICT["white"]
+        return cfg.COLOR_DICT["gray"]
     
-    if h < 10 or h >= 160:   return "merah"
-    if 10 <= h < 25:         return "oranye"
-    if 25 <= h < 35:         return "kuning"
-    if 35 <= h < 85:         return "hijau"
-    if 85 <= h < 130:        return "biru"
-    if 130 <= h < 160:       return "ungu"
+    if h < 10 or h >= 160:   return cfg.COLOR_DICT["red"]
+    if 10 <= h < 25:         return cfg.COLOR_DICT["orange"]
+    if 25 <= h < 35:         return cfg.COLOR_DICT["yellow"]
+    if 35 <= h < 85:         return cfg.COLOR_DICT["green"]
+    if 85 <= h < 130:        return cfg.COLOR_DICT["blue"]
+    if 130 <= h < 160:       return cfg.COLOR_DICT["purple"]
     
-    return "tidak diketahui"
-
-
-def unique_count_app(a):
-    colors, count = np.unique(a.reshape(-1,a.shape[-1]), axis=0, return_counts=True)
-    return colors[count.argmax()]
+    return cfg.COLOR_DICT["unknown"]
 
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 def run(source, model_path, conf, iou, imgsz, device, gui):
+
+    socket = zmq_create()
+    data = np.zeros(1, dtype=cfg.meta_dtype)
+
     model  = YOLO(model_path)
     names  = model.names
     mname  = Path(model_path).stem
 
     src = int(source) if str(source).isdigit() else source
 
-    # ── Setup source ──────────────────────────────────────
     is_screen = (source == "scr")
     sct = None
     monitor = None
@@ -187,12 +156,16 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
         monitor = sct.monitors[1]  # primary monitor
         frame_w = monitor['width']
         frame_h = monitor['height']
+        print(f"Screen size: {frame_w}x{frame_h}")
+        # exit(0)
     else:
         cap = cv2.VideoCapture(src)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open source: {source}")
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Screen size: {frame_w}x{frame_h}")
+        # exit(0)
 
     fps_times: deque = deque(maxlen=FPS_WINDOW)
     paused       = False
@@ -207,17 +180,17 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
 
     try:
         while True:
-            # ── Read frame ───────────────────────────────────
             if is_screen:
-                raw   = sct.grab(monitor)           # <-- grab tiap iterasi
+                raw   = sct.grab(monitor)           # grab tiap iterasi
                 frame = np.array(raw)[:, :, :3]
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                frame = cv2.resize(frame, (frame_w//3, frame_h//3), interpolation=cv2.INTER_AREA)
+                offset = 250
+                frame = frame[0+offset:cfg.FRAME_SIZE[1]+offset, 0+offset:cfg.FRAME_SIZE[0]+offset]  # crop to target size
+                # frame = cv2.resize(frame, (cfg.FRAME_SIZE[0], cfg.FRAME_SIZE[1]), interpolation=cv2.INTER_AREA) #doing this changes the aspect ratio
                 ret   = True
             else:
                 ret, frame = cap.read()
 
-            # ── Key handling ─────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
                 break
@@ -230,14 +203,13 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
                 screenshot_idx += 1
 
             if paused and last_results is not None:
-                cv2.imshow("YOLO Live Inference", frame)
+                cv2.imshow("YOLO", frame)
                 continue
 
             if not ret:
                 print("  Stream ended or frame read failed.")
                 break
 
-            # ── Inference & draw (tidak berubah) ─────────────
             t0 = time.perf_counter()
             results = model.predict(
                 source  = frame,
@@ -261,9 +233,9 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
                     conf_val = float(box.conf[0])
                     cls_id   = int(box.cls[0])
 
-                    if cls_id not in best or conf_val > best[cls_id]['conf']:
-                        color_str = color_det(x1, y1, x2, y2, frame, cls_id)
-                        color_id = COLOR_TO_ID.get(color_str, 9) # 9 is default "tidak diketahui"
+                    if cls_id not in best or conf_val >= best[cls_id]['conf']:
+                        color_id = color_det(x1, y1, x2, y2, frame, cls_id) 
+                        color_str = cfg.ID_TO_COLOR.get(color_id, "unknown")
                         label = f"{names.get(cls_id, str(cls_id))}-{color_str}"
 
                         # draw_box(frame, x1, y1, x2, y2, label, conf_val, cls_id)
@@ -272,31 +244,34 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
                         r  = max(x2 - x1, y2 - y1) / 2
                         cv2.circle(frame, (int(cx), int(cy)), int(r), color=(0, 255, 255), thickness=2)
                         cv2.drawMarker(frame, (int(cx), int(cy)), color=(0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=1)
-
+                        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
                         best[cls_id] = {'x1': cx, 'y1': cy, 'r': r, 'conf': conf_val, 'color_id': color_id}
+                        print(f"  Detected {label} {cls_id} {color_id} with conf {conf_val:.2f} at x {cx:.1f} y {cy:.1f} r {r:.1f}")
 
                     class_counts[cls_id] = class_counts.get(cls_id, 0) + 1
 
-            # --- SEQ LOCK WRITER ---
-            mem['seq'] += 1 # Make odd
-            
-            mem['count'] = len(best)
-            mem['ts']    = time.monotonic()
+            data['ts'] = time.monotonic()
 
-            for i in range(NUM_CLASSES):
+            for i in range(cfg.NUM_CLASSES):
                 if i in best:
                     obj = best[i]
-                    mem['objects'][i]['x1']       = obj['x1']
-                    mem['objects'][i]['y1']       = obj['y1']
-                    mem['objects'][i]['r']        = obj['r']
-                    mem['objects'][i]['conf']     = obj['conf']
-                    mem['objects'][i]['class_id'] = i
-                    mem['objects'][i]['color_id'] = obj['color_id']
+                    data['obj'][0][i]['x1']       = obj['x1']
+                    data['obj'][0][i]['y1']       = obj['y1']
+                    data['obj'][0][i]['r']        = obj['r']
+                    data['obj'][0][i]['conf']     = obj['conf']
+                    data['obj'][0][i]['class_id'] = i
+                    data['obj'][0][i]['color_id'] = obj['color_id']
+                    print(f" {obj['color_id']}")
                 else:
-                    mem['objects'][i]['conf']     = 0.0
+                    data['obj'][0][i]['x1']       = -1
+                    data['obj'][0][i]['y1']       = -1
+                    data['obj'][0][i]['r']        = -1
+                    data['obj'][0][i]['conf']     = -1
+                    data['obj'][0][i]['class_id'] = i
+                    data['obj'][0][i]['color_id'] = cfg.COLOR_DICT["unknown"]
+            
+            zmq_send(socket, data)
 
-            mem['seq'] += 1 # Make even
-            # -----------------------
 
             det_count = sum(class_counts.values())
             draw_hud(frame, fps, det_count, paused, mname, frame_w, frame_h)
@@ -309,10 +284,10 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     finally:
-        # ── Cleanup ───────────────────────────────────────────
         try:
-            shm.close()
-            shm.unlink()
+            zmq_close(socket)
+
+
         except FileNotFoundError:
             pass
         if cap is not None:
@@ -320,19 +295,16 @@ def run(source, model_path, conf, iou, imgsz, device, gui):
         cv2.destroyAllWindows()
         print("Inference stopped.")
 
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Live YOLO inference")
-    parser.add_argument("--source",  default="0",        help="Camera index, video path, or RTSP URL")
+    parser.add_argument("--source",  default="scr",        help="Camera index, video path, or RTSP URL")
     parser.add_argument("--model",   default=MODEL_PATH, help="Path to .pt weights file")
     parser.add_argument("--conf",    default=CONF_THRESH, type=float)
     parser.add_argument("--iou",     default=IOU_THRESH,  type=float)
     parser.add_argument("--imgsz",   default=IMG_SIZE,    type=int)
     parser.add_argument("--device",  default=DEVICE,      help="cpu / 0 / 0,1 / cuda:0")
-    parser.add_argument("--gui", default=False, type=bool)
-    # parser.add_argument("--mem-share", default=False, help="Enable shared memory output")
+    parser.add_argument("--gui", default=True, type=bool)
     args = parser.parse_args()
 
     run(
